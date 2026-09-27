@@ -1,9 +1,7 @@
 /// Standard library import.
 const std = @import("std");
-/// Reference type import.
-const ref_mod = @import("resource_ref.zig");
-/// Lightweight reference import.
-const ResourceRef = ref_mod.ResourceRef;
+/// Resource reference type import.
+const resource_mod = @import("resource.zig");
 
 /// Creates a global per-type resource pool with stable ids.
 ///
@@ -23,6 +21,11 @@ const ResourceRef = ref_mod.ResourceRef;
 /// Returns: pool namespace with static storage and operations.
 pub fn SlotPool(comptime T: type) type {
     return struct {
+        /// ECS-compatible reference to a pooled resource.
+        /// Re-exported here so users take it from the pool
+        /// (`const res: MeshPool.Resource = ...`) instead of importing it directly.
+        pub const Resource = resource_mod.Resource(T);
+
         /// Slot storage, index == stable id. `null` means the slot is free.
         var slots: std.ArrayListUnmanaged(?T) = .empty;
         /// Ids of free slots, reused by the next `add`.
@@ -56,7 +59,7 @@ pub fn SlotPool(comptime T: type) type {
         /// Parameters:
         /// - ref: reference to validate.
         /// Returns: slot index, or null when the reference is stale or empty.
-        fn check(ref: ResourceRef) ?usize {
+        fn check(ref: Resource) ?usize {
             if (ref.isNull()) return null;
             const id: usize = ref.id;
             if (id >= slots.items.len) return null;
@@ -71,7 +74,7 @@ pub fn SlotPool(comptime T: type) type {
         /// - alloc: allocator for slot storage.
         /// - value: resource record to store.
         /// Returns: reference with the slot id and its current generation.
-        pub fn add(alloc: std.mem.Allocator, value: T) !ResourceRef {
+        pub fn add(alloc: std.mem.Allocator, value: T) !Resource {
             if (free_ids.pop()) |id| {
                 slots.items[id] = value;
                 bitSet(occupied.items, id);
@@ -91,16 +94,7 @@ pub fn SlotPool(comptime T: type) type {
         /// Parameters:
         /// - ref: reference to resolve.
         /// Returns: pointer to the value, or null when removed or generation mismatched.
-        pub fn get(ref: ResourceRef) ?*T {
-            const id = check(ref) orelse return null;
-            return &slots.items[id].?;
-        }
-
-        /// Resolves a reference to the stored value (read-only).
-        /// Parameters:
-        /// - ref: reference to resolve.
-        /// Returns: const pointer to the value, or null when removed or generation mismatched.
-        pub fn getConst(ref: ResourceRef) ?*const T {
+        pub fn get(ref: Resource) ?*T {
             const id = check(ref) orelse return null;
             return &slots.items[id].?;
         }
@@ -109,7 +103,7 @@ pub fn SlotPool(comptime T: type) type {
         /// Parameters:
         /// - ref: reference to inspect.
         /// Returns: true when the slot is occupied with a matching generation.
-        pub fn isAlive(ref: ResourceRef) bool {
+        pub fn isAlive(ref: Resource) bool {
             return check(ref) != null;
         }
 
@@ -120,7 +114,7 @@ pub fn SlotPool(comptime T: type) type {
         /// - alloc: allocator for the free list.
         /// - ref: reference to remove.
         /// Returns: stored value, or null when the reference is stale or empty.
-        pub fn remove(alloc: std.mem.Allocator, ref: ResourceRef) !?T {
+        pub fn remove(alloc: std.mem.Allocator, ref: Resource) !?T {
             const id = check(ref) orelse return null;
             const value = slots.items[id].?;
             slots.items[id] = null;
@@ -133,23 +127,23 @@ pub fn SlotPool(comptime T: type) type {
 
         /// Finds the next occupied slot after the given reference.
         /// Intended for `while` iteration over all live elements:
-        /// `var cur: ?ResourceRef = null; while (Pool.nextElement(cur)) |r| { cur = r; ... }`.
+        /// `var cur: ?Pool.Resource = null; while (Pool.nextElement(cur)) |r| { cur = r; ... }`.
         /// Parameters:
         /// - after: reference to start after, or null to start from the beginning.
         /// Returns: reference to the next live slot (with its current generation), or null at the end.
-        pub fn nextElement(after: ?ResourceRef) ?ResourceRef {
+        pub fn nextElement(after: ?Resource) ?Resource {
             var idx: usize = if (after) |r| @as(usize, r.id) + 1 else 0;
             const n: usize = slots.items.len;
             while (idx < n) {
-                const wi = idx / 64;
-                const shift: u6 = @intCast(idx % 64);
+                const wi = idx >> 6;
+                const shift: u6 = @truncate(idx);
                 const word = occupied.items[wi] >> shift;
                 if (word != 0) {
                     const found: usize = idx + @ctz(word);
                     if (found < n) return .{ .id = @intCast(found), .gen = generations.items[found] };
                     return null;
                 }
-                idx = (wi + 1) * 64;
+                idx = (wi + 1) << 6;
             }
             return null;
         }
@@ -220,7 +214,7 @@ test "pool double remove and unknown refs" {
     _ = try P.remove(alloc, r);
     try std.testing.expect(try P.remove(alloc, r) == null); // second remove: null
     try std.testing.expect(P.get(.{ .id = 99, .gen = 0 }) == null); // out of bounds
-    try std.testing.expect(P.get(ref_mod.NO_REF) == null); // null sentinel
+    try std.testing.expect(P.get(P.Resource.NULL) == null); // null sentinel
 }
 
 test "pool nextElement skips holes" {
@@ -229,14 +223,14 @@ test "pool nextElement skips holes" {
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
-    var refs: [5]ResourceRef = undefined;
+    var refs: [5]P.Resource = undefined;
     for (&refs, 0..) |*slot, i| slot.* = try P.add(alloc, .{ .v = @intCast(i) });
     _ = try P.remove(alloc, refs[1]);
     _ = try P.remove(alloc, refs[3]);
 
     var seen: [3]u32 = undefined;
     var n: usize = 0;
-    var cur: ?ResourceRef = null;
+    var cur: ?P.Resource = null;
     while (P.nextElement(cur)) |r| {
         cur = r;
         seen[n] = P.get(r).?.v;
@@ -248,6 +242,99 @@ test "pool nextElement skips holes" {
     // resume after a middle element
     const after = P.nextElement(refs[0]).?;
     try std.testing.expectEqual(refs[2].id, after.id);
+}
+
+test "pool nextElement corner cases" {
+    const R = struct { v: usize };
+    const P = SlotPool(R);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    // empty pool: iteration ends immediately
+    try std.testing.expect(P.nextElement(null) == null);
+
+    // single element: found from the start, nothing after it
+    const only = try P.add(alloc, .{ .v = 100 });
+    {
+        const got = P.nextElement(null).?;
+        try std.testing.expectEqual(only.id, got.id);
+        try std.testing.expectEqual(only.gen, got.gen);
+        try std.testing.expectEqual(@as(usize, 100), P.get(got).?.v);
+    }
+    try std.testing.expect(P.nextElement(only) == null);
+    _ = try P.remove(alloc, only);
+    try std.testing.expect(P.nextElement(null) == null); // empty again
+
+    // holes at the start and at the end
+    const a = try P.add(alloc, .{ .v = 1 });
+    const b = try P.add(alloc, .{ .v = 2 });
+    const c = try P.add(alloc, .{ .v = 3 });
+    _ = try P.remove(alloc, a); // hole at the start
+    _ = try P.remove(alloc, c); // hole at the end
+    {
+        const first = P.nextElement(null).?;
+        try std.testing.expectEqual(b.id, first.id);
+        try std.testing.expectEqual(b.gen, first.gen);
+        try std.testing.expect(P.nextElement(first) == null); // b is the last live slot
+    }
+    // a stale (removed) reference still resumes iteration by id, not by generation
+    try std.testing.expectEqual(b.id, P.nextElement(a).?.id);
+    // out-of-bounds and null-sentinel positions end iteration without crashing
+    try std.testing.expect(P.nextElement(.{ .id = 5000, .gen = 0 }) == null);
+    try std.testing.expect(P.nextElement(P.Resource.NULL) == null);
+
+    // recycled id shows up with the new generation, the stale one never resurfaces
+    const d = try P.add(alloc, .{ .v = 4 }); // LIFO free list: reuses id of c
+    try std.testing.expectEqual(c.id, d.id);
+    try std.testing.expect(d.gen == c.gen +% 1);
+    {
+        var cur: ?P.Resource = null;
+        var n: usize = 0;
+        while (P.nextElement(cur)) |r| {
+            if (cur) |prev| try std.testing.expect(r.id > prev.id); // strictly ascending
+            cur = r;
+            n += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), n); // b and d only
+        try std.testing.expectEqual(d.id, cur.?.id);
+        try std.testing.expectEqual(d.gen, cur.?.gen);
+    }
+
+    // multi-word bitmap: 200 slots cross several 64-bit occupancy words
+    P.deinit(alloc); // reset the pool so ids start from 0
+    const N = 200;
+    var refs: [N]P.Resource = undefined;
+    for (&refs, 0..) |*slot, i| slot.* = try P.add(alloc, .{ .v = i });
+    var removed: usize = 0;
+    for (refs, 0..) |r, i| {
+        if (i % 3 == 0 or i == 63 or i == 64 or i == 65 or i == 127 or i == 128) {
+            _ = try P.remove(alloc, r);
+            removed += 1;
+        }
+    }
+    // full sweep: ascending ids, every ref resolves to its own slot, count matches
+    {
+        var cur: ?P.Resource = null;
+        var n: usize = 0;
+        while (P.nextElement(cur)) |r| {
+            if (cur) |prev| try std.testing.expect(r.id > prev.id);
+            try std.testing.expect(P.isAlive(r));
+            try std.testing.expectEqual(@as(usize, r.id), P.get(r).?.v);
+            cur = r;
+            n += 1;
+        }
+        try std.testing.expectEqual(N - removed, n);
+        try std.testing.expectEqual(N - removed, P.liveCount());
+        try std.testing.expect(P.nextElement(cur) == null);
+    }
+    // resume across a 64-bit word boundary: 63..66 are holes, next live after 62 is 67
+    try std.testing.expectEqual(@as(u24, 67), P.nextElement(refs[62]).?.id);
+    // same across the second boundary: 127..129 are holes, next live after 126 is 130
+    try std.testing.expectEqual(@as(u24, 130), P.nextElement(refs[126]).?.id);
+    // resume from a removed ref lands on the next live slot (99 removed -> 100 live)
+    try std.testing.expectEqual(@as(u24, 100), P.nextElement(refs[99]).?.id);
+    // after the last live slot the iteration ends
+    try std.testing.expect(P.nextElement(refs[N - 1]) == null);
 }
 
 test "pool stores pointer resources directly" {
