@@ -4,6 +4,7 @@
     .fingerprint = 0x44257fdee36549a8, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .bit_tree = .{ .path = "../bit_tree" },
     },
     .paths = .{
         "build.zig",

@@ -1,14 +1,13 @@
 /// Global per-type resource pool with stable ids, free list, occupancy bitmap and generations.
 pub const SlotPool = @import("pool.zig").SlotPool;
 
-// Intended downstream wiring (this package stays dependency-free; the user
-// wires it with resource abstractions in their own project):
+// Intended downstream wiring (occupancy lives in `bit_tree.Bitset`):
 //   const MeshPool = SlotPool(MyMeshRecord);      // one global pool per record type
 //   const res: MeshPool.Resource = try MeshPool.add(alloc, record); // 4-byte ECS-ready ref
 //   if (res.get()) |rec| { ... }                 // null when removed or stale
 //   if (try MeshPool.remove(alloc, res)) |rec| { /* destroy separately */ }
-//   var cur: ?MeshPool.Resource = null;
-//   while (MeshPool.nextElement(cur)) |r| { cur = r; ... }
+//   const It = MeshPool.Iterator(*Ctx, Ctx.onItem, .forward);
+//   _ = try It.iterateAll(&ctx, null, null);     // onItem(ctx, ref: Resource)
 
 test {
     _ = @import("pool.zig");

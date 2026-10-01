@@ -2,6 +2,11 @@
 const std = @import("std");
 /// Resource reference type import.
 const resource_mod = @import("resource.zig");
+/// Hierarchical bit utilities, occupancy backend.
+const bit_tree = @import("bit_tree");
+
+/// Flat occupancy bitset, one bit per slot.
+const Occupancy = bit_tree.Bitset(.u64);
 
 /// Creates a global per-type resource pool with stable ids.
 ///
@@ -12,7 +17,7 @@ const resource_mod = @import("resource.zig");
 /// Storage per pool:
 /// - `slots` — resources, index == stable id;
 /// - `free_ids` — ids of empty slots reused by the next `add`;
-/// - `occupied` — occupancy bitmap, one bit per slot;
+/// - `occupied` — occupancy bitmap (`bit_tree.Bitset`), one bit per slot;
 /// - `generations` — one byte per slot, bumped (`+%= 1`) on every `remove`.
 ///
 /// Parameters:
@@ -30,30 +35,10 @@ pub fn SlotPool(comptime T: type) type {
         var slots: std.ArrayListUnmanaged(?T) = .empty;
         /// Ids of free slots, reused by the next `add`.
         var free_ids: std.ArrayListUnmanaged(u32) = .empty;
-        /// Occupancy bitmap, one bit per slot.
-        var occupied: std.ArrayListUnmanaged(u64) = .empty;
+        /// Occupancy bitmap, one bit per slot. `bits_count` mirrors `slots.len`.
+        var occupied: Occupancy = .{};
         /// Generation byte per slot, bumped on every `remove`.
         var generations: std.ArrayListUnmanaged(u8) = .empty;
-        /// Number of currently occupied slots.
-        var live_count: usize = 0;
-
-        /// Reads one occupancy bit.
-        fn bitGet(words: []const u64, idx: usize) bool {
-            return (words[idx / 64] & (@as(u64, 1) << @intCast(idx % 64))) != 0;
-        }
-        /// Sets one occupancy bit.
-        fn bitSet(words: []u64, idx: usize) void {
-            words[idx / 64] |= (@as(u64, 1) << @intCast(idx % 64));
-        }
-        /// Clears one occupancy bit.
-        fn bitClear(words: []u64, idx: usize) void {
-            words[idx / 64] &= ~(@as(u64, 1) << @intCast(idx % 64));
-        }
-        /// Grows the bitmap so it covers `idx`.
-        fn ensureWord(alloc: std.mem.Allocator, idx: usize) !void {
-            const need = idx / 64 + 1;
-            if (occupied.items.len < need) try occupied.appendNTimes(alloc, 0, need - occupied.items.len);
-        }
 
         /// Validates a reference against bounds, occupancy and generation.
         /// Parameters:
@@ -63,7 +48,8 @@ pub fn SlotPool(comptime T: type) type {
             if (ref.isNull()) return null;
             const id: usize = ref.id;
             if (id >= slots.items.len) return null;
-            if (!bitGet(occupied.items, id)) return null;
+            if (id >= occupied.bits_count) return null;
+            if (occupied.getBit(@intCast(id)) == .inactive) return null;
             if (generations.items[id] != ref.gen) return null;
             return id;
         }
@@ -75,18 +61,16 @@ pub fn SlotPool(comptime T: type) type {
         /// - value: resource record to store.
         /// Returns: reference with the slot id and its current generation.
         pub fn add(alloc: std.mem.Allocator, value: T) !Resource {
-            if (free_ids.pop()) |id| {
-                slots.items[id] = value;
-                bitSet(occupied.items, id);
-                live_count += 1;
-                return .{ .id = @intCast(id), .gen = generations.items[id] };
+            if (free_ids.pop()) |reuse_id| {
+                slots.items[reuse_id] = value;
+                occupied.setBit(reuse_id, .active);
+                return .{ .id = @intCast(reuse_id), .gen = generations.items[reuse_id] };
             }
             const id: usize = slots.items.len;
             try slots.append(alloc, value);
             try generations.append(alloc, 0);
-            try ensureWord(alloc, id);
-            bitSet(occupied.items, id);
-            live_count += 1;
+            try occupied.resize(alloc, @intCast(slots.items.len), .inactive);
+            occupied.setBit(@intCast(id), .active);
             return .{ .id = @intCast(id), .gen = 0 };
         }
 
@@ -118,40 +102,55 @@ pub fn SlotPool(comptime T: type) type {
             const id = check(ref) orelse return null;
             const value = slots.items[id].?;
             slots.items[id] = null;
-            bitClear(occupied.items, id);
+            occupied.setBit(@intCast(id), .inactive);
             generations.items[id] +%= 1;
-            live_count -= 1;
             try free_ids.append(alloc, @intCast(id));
             return value;
         }
 
-        /// Finds the next occupied slot after the given reference.
-        /// Intended for `while` iteration over all live elements:
-        /// `var cur: ?Pool.Resource = null; while (Pool.nextElement(cur)) |r| { cur = r; ... }`.
-        /// Parameters:
-        /// - after: reference to start after, or null to start from the beginning.
-        /// Returns: reference to the next live slot (with its current generation), or null at the end.
-        pub fn nextElement(after: ?Resource) ?Resource {
-            var idx: usize = if (after) |r| @as(usize, r.id) + 1 else 0;
-            const n: usize = slots.items.len;
-            while (idx < n) {
-                const wi = idx >> 6;
-                const shift: u6 = @truncate(idx);
-                const word = occupied.items[wi] >> shift;
-                if (word != 0) {
-                    const found: usize = idx + @ctz(word);
-                    if (found < n) return .{ .id = @intCast(found), .gen = generations.items[found] };
-                    return null;
+        /// Active-only iterator over live slots, thin wrapper over the
+        /// `bit_tree` bitset iterator with the inactive callback removed.
+        /// The single callback fires per occupied bit with a ready `Resource`
+        /// (`get()` resolves the value); iterating inactive bits makes no
+        /// sense here and would break pool invariants, so it is not exposed.
+        ///
+        /// Idiom (same shape as `t_ecs` queries):
+        /// `const It = Pool.Iterator(*Ctx, Ctx.onItem, .forward);`
+        /// `try It.iterateAll(&ctx, null, null);`
+        pub fn Iterator(
+            comptime Context: type,
+            comptime on_item: fn (context: Context, ref: Resource) callconv(.@"inline") anyerror!bool,
+            comptime direction: bit_tree.Direction,
+        ) type {
+            return struct {
+                /// Carrier for the outer caller context through the bitset walk.
+                const InnerCtx = struct {
+                    outer: Context,
+                };
+
+                /// Maps one active bit id to its live reference and forwards it.
+                inline fn shim(ctx: InnerCtx, bit_id: u32) anyerror!bool {
+                    const idx: usize = @intCast(bit_id);
+                    const ref: Resource = .{ .id = @intCast(bit_id), .gen = generations.items[idx] };
+                    return try on_item(ctx.outer, ref);
                 }
-                idx = (wi + 1) << 6;
-            }
-            return null;
+
+                /// Underlying bitset iterator: active only, inactive arm is null.
+                const Inner = Occupancy.Iterator(InnerCtx, shim, null, direction);
+
+                /// Runs the walk over an optional bit range.
+                /// Returns false on early callback exit (`on_item` returned false);
+                /// a `try` inside `on_item` aborts the walk with that error.
+                pub fn iterateAll(ctx: Context, start_bit: ?u32, end_bit: ?u32) anyerror!bool {
+                    return Inner.iterateAll(.{ .bitset = &occupied, .context = .{ .outer = ctx } }, start_bit, end_bit);
+                }
+            };
         }
 
         /// Returns the number of currently occupied slots.
-        /// Returns: live slot count in O(1).
+        /// Returns: live slot count in O(1) via the bitset active counter.
         pub fn liveCount() usize {
-            return live_count;
+            return @intCast(occupied.active_bits_counter);
         }
 
         /// Returns the total slot capacity (live + free).
@@ -170,10 +169,96 @@ pub fn SlotPool(comptime T: type) type {
             free_ids.deinit(alloc);
             free_ids = .empty;
             occupied.deinit(alloc);
-            occupied = .empty;
+            occupied = .{};
             generations.deinit(alloc);
             generations = .empty;
-            live_count = 0;
+        }
+
+        /// Destroys every live item through a caller callback, in forward order.
+        /// Builds a forward `Iterator` with an `Allocator` context under the
+        /// hood and immediately runs it over the full range, so callers pass
+        /// only the per-item destructor. The reference resolves via `get()`.
+        /// Pool bookkeeping is left intact: call `deinit` afterwards to free it.
+        /// The callback must not `add`/`remove` slots: mutating occupancy
+        /// mid-walk would corrupt the iteration.
+        /// Parameters:
+        /// - alloc: context forwarded to every callback invocation.
+        /// - on_item_deinit: per-live-slot destructor, receives allocator and ref.
+        pub fn deinitItems(
+            alloc: std.mem.Allocator,
+            comptime on_item_deinit: fn (item_alloc: std.mem.Allocator, ref: Resource) callconv(.@"inline") anyerror!void,
+        ) !void {
+            const Adapter = struct {
+                inline fn onItem(a: std.mem.Allocator, ref: Resource) anyerror!bool {
+                    try on_item_deinit(a, ref);
+                    return true;
+                }
+            };
+            const It = Iterator(std.mem.Allocator, Adapter.onItem, .forward);
+            _ = try It.iterateAll(alloc, null, null);
+        }
+
+        /// Destroys every live item through its own destructor, in forward order.
+        /// Default callback over `deinitItems`: prefers `deinit(allocator)` and
+        /// falls back to `destroy(allocator)`. For pointer records (e.g.
+        /// `*Texture`) the pointee type is inspected instead. The expected shape
+        /// is `pub fn deinit(self: *Self, std.mem.Allocator) void` (same for
+        /// `destroy`); a type-erased `self: *anyopaque` receiver is accepted too
+        /// (cast it back inside with `@ptrCast(@alignCast(self))`), as is an
+        /// `!void` return (propagated).
+        /// If neither declaration exists, compilation fails with a
+        /// hint to use `deinitItems` with an explicit callback instead.
+        /// Pool bookkeeping is left intact: call `deinit` afterwards to free it.
+        /// The destructor must not `add`/`remove` slots: mutating occupancy
+        /// mid-walk would corrupt the iteration.
+        /// Parameters:
+        /// - alloc: allocator forwarded to every destructor invocation.
+        pub fn deinitItemsAuto(alloc: std.mem.Allocator) !void {
+            const Host = switch (@typeInfo(T)) {
+                .pointer => |p| p.child,
+                else => T,
+            };
+            const has_deinit = switch (@typeInfo(Host)) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(Host, "deinit"),
+                else => false,
+            };
+            const has_destroy = switch (@typeInfo(Host)) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(Host, "destroy"),
+                else => false,
+            };
+            if (!has_deinit and !has_destroy) {
+                @compileError("SlotPool(" ++ @typeName(T) ++ "): deinitItemsAuto requires `pub fn deinit(allocator)` or `pub fn destroy(allocator)` on the pooled type (or its pointee for pointer types); use deinitItems(alloc, customCallback) instead.");
+            }
+            // Tolerates both `void` and `!void` destructors: the result is only
+            // `try`-ed when it actually is an error union.
+            // Qualified calls (`Host.deinit(recv, a)`) are used instead of method
+            // syntax on purpose: a `self: *anyopaque` destructor is not a member
+            // function, so `recv.deinit(a)` would not resolve, while the
+            // qualified form accepts both `*Self` and `*anyopaque` receivers.
+            const Auto = struct {
+                inline fn run(a: std.mem.Allocator, ref: Resource) anyerror!void {
+                    if (comptime @typeInfo(T) == .pointer) {
+                        const stored: T = get(ref).?.*;
+                        if (comptime has_deinit) {
+                            const r = Host.deinit(stored, a);
+                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                        } else {
+                            const r = Host.destroy(stored, a);
+                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                        }
+                    } else {
+                        const item = get(ref).?;
+                        if (comptime has_deinit) {
+                            const r = Host.deinit(item, a);
+                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                        } else {
+                            const r = Host.destroy(item, a);
+                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                        }
+                    }
+                }
+            };
+            return deinitItems(alloc, Auto.run);
         }
     };
 }
@@ -217,7 +302,7 @@ test "pool double remove and unknown refs" {
     try std.testing.expect(P.get(P.Resource.NULL) == null); // null sentinel
 }
 
-test "pool nextElement skips holes" {
+test "pool iterator visits live refs in order" {
     const R = struct { v: u32 };
     const P = SlotPool(R);
     const alloc = std.testing.allocator;
@@ -228,80 +313,140 @@ test "pool nextElement skips holes" {
     _ = try P.remove(alloc, refs[1]);
     _ = try P.remove(alloc, refs[3]);
 
-    var seen: [3]u32 = undefined;
-    var n: usize = 0;
-    var cur: ?P.Resource = null;
-    while (P.nextElement(cur)) |r| {
-        cur = r;
-        seen[n] = P.get(r).?.v;
-        n += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 2, 4 }, seen[0..n]);
-    try std.testing.expect(P.nextElement(cur) == null);
-    // resume after a middle element
-    const after = P.nextElement(refs[0]).?;
-    try std.testing.expectEqual(refs[2].id, after.id);
+    const Collect = struct {
+        ids: [3]u32 = undefined,
+        n: usize = 0,
+        inline fn push(ctx: *@This(), ref: P.Resource) anyerror!bool {
+            try std.testing.expect(P.isAlive(ref));
+            ctx.ids[ctx.n] = ref.id;
+            // ref resolves through get(), no IterationResult needed
+            try std.testing.expectEqual(ref.id, P.get(ref).?.v);
+            ctx.n += 1;
+            return true;
+        }
+    };
+    var c = Collect{};
+    const It = P.Iterator(*Collect, Collect.push, .forward);
+    try std.testing.expect(try It.iterateAll(&c, null, null));
+    try std.testing.expectEqual(@as(usize, 3), c.n);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 2, 4 }, c.ids[0..c.n]);
 }
 
-test "pool nextElement corner cases" {
+test "pool iterator corner cases" {
     const R = struct { v: usize };
     const P = SlotPool(R);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
-    // empty pool: iteration ends immediately
-    try std.testing.expect(P.nextElement(null) == null);
+    const Collect = struct {
+        ids: [8]u32 = undefined,
+        n: usize = 0,
+        inline fn push(ctx: *@This(), ref: P.Resource) anyerror!bool {
+            ctx.ids[ctx.n] = ref.id;
+            ctx.n += 1;
+            return true;
+        }
+    };
 
-    // single element: found from the start, nothing after it
+    // empty pool: no visits, completed walk
+    {
+        var c = Collect{};
+        const It = P.Iterator(*Collect, Collect.push, .forward);
+        try std.testing.expect(try It.iterateAll(&c, null, null));
+        try std.testing.expectEqual(@as(usize, 0), c.n);
+    }
+
+    // single element, forward and backward agree
     const only = try P.add(alloc, .{ .v = 100 });
     {
-        const got = P.nextElement(null).?;
-        try std.testing.expectEqual(only.id, got.id);
-        try std.testing.expectEqual(only.gen, got.gen);
-        try std.testing.expectEqual(@as(usize, 100), P.get(got).?.v);
+        var c = Collect{};
+        const It = P.Iterator(*Collect, Collect.push, .forward);
+        try std.testing.expect(try It.iterateAll(&c, null, null));
+        try std.testing.expectEqual(@as(usize, 1), c.n);
+        try std.testing.expectEqual(only.id, c.ids[0]);
+        try std.testing.expectEqual(@as(usize, 100), P.get(.{ .id = @intCast(c.ids[0]), .gen = only.gen }).?.v);
     }
-    try std.testing.expect(P.nextElement(only) == null);
+    {
+        var c = Collect{};
+        const It = P.Iterator(*Collect, Collect.push, .backward);
+        try std.testing.expect(try It.iterateAll(&c, null, null));
+        try std.testing.expectEqual(@as(usize, 1), c.n);
+        try std.testing.expectEqual(only.id, c.ids[0]);
+    }
     _ = try P.remove(alloc, only);
-    try std.testing.expect(P.nextElement(null) == null); // empty again
+    {
+        var c = Collect{};
+        const It = P.Iterator(*Collect, Collect.push, .forward);
+        try std.testing.expect(try It.iterateAll(&c, null, null));
+        try std.testing.expectEqual(@as(usize, 0), c.n);
+    }
 
-    // holes at the start and at the end
+    // holes at the start and at the end: only b stays live
     const a = try P.add(alloc, .{ .v = 1 });
     const b = try P.add(alloc, .{ .v = 2 });
-    const c = try P.add(alloc, .{ .v = 3 });
-    _ = try P.remove(alloc, a); // hole at the start
-    _ = try P.remove(alloc, c); // hole at the end
+    const c_ref = try P.add(alloc, .{ .v = 3 });
+    _ = try P.remove(alloc, a);
+    _ = try P.remove(alloc, c_ref);
     {
-        const first = P.nextElement(null).?;
-        try std.testing.expectEqual(b.id, first.id);
-        try std.testing.expectEqual(b.gen, first.gen);
-        try std.testing.expect(P.nextElement(first) == null); // b is the last live slot
+        var c = Collect{};
+        const It = P.Iterator(*Collect, Collect.push, .forward);
+        try std.testing.expect(try It.iterateAll(&c, null, null));
+        try std.testing.expectEqual(@as(usize, 1), c.n);
+        try std.testing.expectEqual(b.id, c.ids[0]);
     }
-    // a stale (removed) reference still resumes iteration by id, not by generation
-    try std.testing.expectEqual(b.id, P.nextElement(a).?.id);
-    // out-of-bounds and null-sentinel positions end iteration without crashing
-    try std.testing.expect(P.nextElement(.{ .id = 5000, .gen = 0 }) == null);
-    try std.testing.expect(P.nextElement(P.Resource.NULL) == null);
-
-    // recycled id shows up with the new generation, the stale one never resurfaces
-    const d = try P.add(alloc, .{ .v = 4 }); // LIFO free list: reuses id of c
-    try std.testing.expectEqual(c.id, d.id);
-    try std.testing.expect(d.gen == c.gen +% 1);
+    // ranged walk that excludes the live slot visits nothing
     {
-        var cur: ?P.Resource = null;
-        var n: usize = 0;
-        while (P.nextElement(cur)) |r| {
-            if (cur) |prev| try std.testing.expect(r.id > prev.id); // strictly ascending
-            cur = r;
-            n += 1;
-        }
-        try std.testing.expectEqual(@as(usize, 2), n); // b and d only
-        try std.testing.expectEqual(d.id, cur.?.id);
-        try std.testing.expectEqual(d.gen, cur.?.gen);
+        var c = Collect{};
+        const It = P.Iterator(*Collect, Collect.push, .forward);
+        try std.testing.expect(try It.iterateAll(&c, 0, b.id));
+        try std.testing.expectEqual(@as(usize, 0), c.n);
+    }
+    // resume via bit range past the hole lands on b
+    {
+        var c = Collect{};
+        const It = P.Iterator(*Collect, Collect.push, .forward);
+        try std.testing.expect(try It.iterateAll(&c, a.id, null));
+        try std.testing.expectEqual(@as(usize, 1), c.n);
+        try std.testing.expectEqual(b.id, c.ids[0]);
     }
 
-    // multi-word bitmap: 200 slots cross several 64-bit occupancy words
-    P.deinit(alloc); // reset the pool so ids start from 0
+    // early exit: first callback returns false
+    {
+        const Stop = struct {
+            n: usize = 0,
+            inline fn push(ctx: *@This(), ref: P.Resource) anyerror!bool {
+                _ = ref;
+                ctx.n += 1;
+                return false;
+            }
+        };
+        var s = Stop{};
+        const It = P.Iterator(*Stop, Stop.push, .forward);
+        try std.testing.expect(!try It.iterateAll(&s, null, null));
+        try std.testing.expectEqual(@as(usize, 1), s.n);
+    }
+
+    // error propagation from the callback
+    {
+        const Fail = struct {
+            inline fn push(ctx: *@This(), ref: P.Resource) anyerror!bool {
+                _ = ctx;
+                _ = ref;
+                return error.Boom;
+            }
+        };
+        var f = Fail{};
+        const It = P.Iterator(*Fail, Fail.push, .forward);
+        try std.testing.expectError(error.Boom, It.iterateAll(&f, null, null));
+    }
+}
+
+test "pool iterator multi-word bitmap" {
+    const R = struct { v: usize };
+    const P = SlotPool(R);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
     const N = 200;
     var refs: [N]P.Resource = undefined;
     for (&refs, 0..) |*slot, i| slot.* = try P.add(alloc, .{ .v = i });
@@ -312,29 +457,57 @@ test "pool nextElement corner cases" {
             removed += 1;
         }
     }
-    // full sweep: ascending ids, every ref resolves to its own slot, count matches
-    {
-        var cur: ?P.Resource = null;
-        var n: usize = 0;
-        while (P.nextElement(cur)) |r| {
-            if (cur) |prev| try std.testing.expect(r.id > prev.id);
-            try std.testing.expect(P.isAlive(r));
-            try std.testing.expectEqual(@as(usize, r.id), P.get(r).?.v);
-            cur = r;
-            n += 1;
+
+    const Collect = struct {
+        n: usize = 0,
+        prev: ?u32 = null,
+        inline fn push(ctx: *@This(), ref: P.Resource) anyerror!bool {
+            if (ctx.prev) |p| try std.testing.expect(ref.id > p);
+            try std.testing.expect(P.isAlive(ref));
+            try std.testing.expectEqual(@as(usize, ref.id), P.get(ref).?.v);
+            ctx.prev = ref.id;
+            ctx.n += 1;
+            return true;
         }
-        try std.testing.expectEqual(N - removed, n);
-        try std.testing.expectEqual(N - removed, P.liveCount());
-        try std.testing.expect(P.nextElement(cur) == null);
+    };
+    var c = Collect{};
+    const It = P.Iterator(*Collect, Collect.push, .forward);
+    try std.testing.expect(try It.iterateAll(&c, null, null));
+    try std.testing.expectEqual(N - removed, c.n);
+    try std.testing.expectEqual(N - removed, P.liveCount());
+
+    // backward walk visits the same count in reverse
+    const Rev = struct {
+        n: usize = 0,
+        prev: ?u32 = null,
+        inline fn push(ctx: *@This(), ref: P.Resource) anyerror!bool {
+            if (ctx.prev) |p| try std.testing.expect(ref.id < p);
+            ctx.prev = ref.id;
+            ctx.n += 1;
+            return true;
+        }
+    };
+    var rev = Rev{};
+    const RIt = P.Iterator(*Rev, Rev.push, .backward);
+    try std.testing.expect(try RIt.iterateAll(&rev, null, null));
+    try std.testing.expectEqual(N - removed, rev.n);
+
+    // resume across a 64-bit word boundary via bit range: 63..66 are holes, next live is 67
+    {
+        const Head = struct {
+            first: ?u32 = null,
+            n: usize = 0,
+            inline fn push(ctx: *@This(), ref: P.Resource) anyerror!bool {
+                if (ctx.first == null) ctx.first = ref.id;
+                ctx.n += 1;
+                return true;
+            }
+        };
+        var head = Head{};
+        const HIt = P.Iterator(*Head, Head.push, .forward);
+        try std.testing.expect(try HIt.iterateAll(&head, 63, null));
+        try std.testing.expectEqual(@as(?u32, 67), head.first);
     }
-    // resume across a 64-bit word boundary: 63..66 are holes, next live after 62 is 67
-    try std.testing.expectEqual(@as(u24, 67), P.nextElement(refs[62]).?.id);
-    // same across the second boundary: 127..129 are holes, next live after 126 is 130
-    try std.testing.expectEqual(@as(u24, 130), P.nextElement(refs[126]).?.id);
-    // resume from a removed ref lands on the next live slot (99 removed -> 100 live)
-    try std.testing.expectEqual(@as(u24, 100), P.nextElement(refs[99]).?.id);
-    // after the last live slot the iteration ends
-    try std.testing.expect(P.nextElement(refs[N - 1]) == null);
 }
 
 test "pool stores pointer resources directly" {
@@ -345,4 +518,237 @@ test "pool stores pointer resources directly" {
     var x: u32 = 42;
     const r = try P.add(alloc, &x);
     try std.testing.expectEqual(@as(u32, 42), P.get(r).?.*.*);
+}
+
+test "pool deinitItems visits every live ref with allocator context" {
+    const R = struct { v: u32, owned: []u8 };
+    const P = SlotPool(R);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    // empty pool: callback never fires, no error
+    {
+        const Never = struct {
+            inline fn run(a: std.mem.Allocator, ref: P.Resource) anyerror!void {
+                _ = a;
+                _ = ref;
+                unreachable;
+            }
+        };
+        try P.deinitItems(alloc, Never.run);
+    }
+
+    var refs: [5]P.Resource = undefined;
+    for (&refs, 0..) |*slot, i| {
+        const owned = try alloc.dupe(u8, &[_]u8{@intCast(i)});
+        slot.* = try P.add(alloc, .{ .v = @intCast(i), .owned = owned });
+    }
+    // free one slot manually so deinitItems must skip the hole
+    {
+        const taken = (try P.remove(alloc, refs[0])).?;
+        alloc.free(taken.owned);
+    }
+    try std.testing.expectEqual(@as(usize, 4), P.liveCount());
+
+    const FreeAll = struct {
+        inline fn run(a: std.mem.Allocator, ref: P.Resource) anyerror!void {
+            // allocator context arrives intact, ref resolves through get()
+            try std.testing.expect(P.isAlive(ref));
+            const item = P.get(ref).?;
+            a.free(item.owned);
+            // mark freed without touching pool structure (no add/remove here)
+            item.owned = &.{};
+        }
+    };
+    try P.deinitItems(alloc, FreeAll.run);
+    // bookkeeping untouched: slots still tracked, values now hold empty slices
+    try std.testing.expectEqual(@as(usize, 4), P.liveCount());
+    {
+        const Counter = struct {
+            inline fn push(ctx: *usize, ref: P.Resource) anyerror!bool {
+                _ = ref;
+                ctx.* += 1;
+                return true;
+            }
+        };
+        var n: usize = 0;
+        const It = P.Iterator(*usize, Counter.push, .forward);
+        _ = try It.iterateAll(&n, null, null);
+        try std.testing.expectEqual(@as(usize, 4), n);
+    }
+}
+
+test "pool deinitItems propagates callback errors" {
+    const R = struct { v: u32 };
+    const P = SlotPool(R);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    _ = try P.add(alloc, .{ .v = 1 });
+    _ = try P.add(alloc, .{ .v = 2 });
+    const Fail = struct {
+        inline fn run(a: std.mem.Allocator, ref: P.Resource) anyerror!void {
+            _ = a;
+            _ = ref;
+            return error.Boom;
+        }
+    };
+    try std.testing.expectError(error.Boom, P.deinitItems(alloc, Fail.run));
+}
+
+test "pool deinitItemsAuto prefers deinit over destroy" {
+    const R = struct {
+        owned: []u8,
+        var calls_deinit: usize = 0;
+        var calls_destroy: usize = 0;
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.owned);
+            self.owned = &.{};
+            calls_deinit += 1;
+        }
+        pub fn destroy(self: *@This(), alloc: std.mem.Allocator) void {
+            _ = self;
+            _ = alloc;
+            calls_destroy += 1;
+        }
+    };
+    const P = SlotPool(R);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    var refs: [3]P.Resource = undefined;
+    for (&refs, 0..) |*slot, i| {
+        const owned = try alloc.dupe(u8, &[_]u8{@intCast(i)});
+        slot.* = try P.add(alloc, .{ .owned = owned });
+    }
+    // free one slot manually so the auto walk must skip the hole
+    {
+        const taken = (try P.remove(alloc, refs[0])).?;
+        alloc.free(taken.owned);
+    }
+
+    try P.deinitItemsAuto(alloc);
+    try std.testing.expectEqual(@as(usize, 2), R.calls_deinit);
+    try std.testing.expectEqual(@as(usize, 0), R.calls_destroy);
+    // bookkeeping untouched: slots still tracked
+    try std.testing.expectEqual(@as(usize, 2), P.liveCount());
+}
+
+test "pool deinitItemsAuto falls back to destroy" {
+    const D = struct {
+        owned: []u8,
+        var calls: usize = 0;
+        // fallible form: exercises the `!void` destructor path
+        pub fn destroy(self: *@This(), alloc: std.mem.Allocator) !void {
+            alloc.free(self.owned);
+            self.owned = &.{};
+            calls += 1;
+        }
+    };
+    const P = SlotPool(D);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    for (0..2) |i| {
+        const owned = try alloc.dupe(u8, &[_]u8{@intCast(i)});
+        _ = try P.add(alloc, .{ .owned = owned });
+    }
+
+    try P.deinitItemsAuto(alloc);
+    try std.testing.expectEqual(@as(usize, 2), D.calls);
+    try std.testing.expectEqual(@as(usize, 2), P.liveCount());
+}
+
+test "pool deinitItemsAuto propagates destructor errors" {
+    const F = struct {
+        v: u32,
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) !void {
+            _ = self;
+            _ = alloc;
+            return error.Boom;
+        }
+    };
+    const P = SlotPool(F);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    _ = try P.add(alloc, .{ .v = 1 });
+    try std.testing.expectError(error.Boom, P.deinitItemsAuto(alloc));
+}
+
+test "pool deinitItemsAuto supports anyopaque self destructor" {
+    const G = struct {
+        owned: []u8,
+        var calls: usize = 0;
+        // type-erased self: cast back to the concrete type inside
+        pub fn deinit(self: *anyopaque, alloc: std.mem.Allocator) void {
+            const this: *@This() = @ptrCast(@alignCast(self));
+            alloc.free(this.owned);
+            this.owned = &.{};
+            calls += 1;
+        }
+    };
+    const P = SlotPool(G);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    for (0..2) |i| {
+        const owned = try alloc.dupe(u8, &[_]u8{@intCast(i)});
+        _ = try P.add(alloc, .{ .owned = owned });
+    }
+    try P.deinitItemsAuto(alloc);
+    try std.testing.expectEqual(@as(usize, 2), G.calls);
+    try std.testing.expectEqual(@as(usize, 2), P.liveCount());
+}
+
+test "pool deinitItemsAuto supports anyopaque self destroy on pointee" {
+    const H = struct {
+        owned: []u8,
+        var calls: usize = 0;
+        // fallible type-erased destroy on the pointee behind a `*H` record
+        pub fn destroy(self: *anyopaque, alloc: std.mem.Allocator) !void {
+            const this: *@This() = @ptrCast(@alignCast(self));
+            alloc.free(this.owned);
+            this.owned = &.{};
+            calls += 1;
+        }
+    };
+    const P = SlotPool(*H);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+    var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+    _ = try P.add(alloc, &h1);
+    _ = try P.add(alloc, &h2);
+
+    try P.deinitItemsAuto(alloc);
+    try std.testing.expectEqual(@as(usize, 2), H.calls);
+    try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+    try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+}
+
+test "pool deinitItemsAuto works for pointer records via pointee" {
+    const Tex = struct {
+        owned: []u8,
+        var calls: usize = 0;
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.owned);
+            self.owned = &.{};
+            calls += 1;
+        }
+    };
+    const P = SlotPool(*Tex);
+    const alloc = std.testing.allocator;
+    defer P.deinit(alloc);
+
+    var t1 = Tex{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+    var t2 = Tex{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+    _ = try P.add(alloc, &t1);
+    _ = try P.add(alloc, &t2);
+
+    try P.deinitItemsAuto(alloc);
+    try std.testing.expectEqual(@as(usize, 2), Tex.calls);
+    try std.testing.expectEqual(@as(usize, 0), t1.owned.len);
+    try std.testing.expectEqual(@as(usize, 0), t2.owned.len);
 }
