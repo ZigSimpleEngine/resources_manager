@@ -201,11 +201,16 @@ pub fn SlotPool(comptime T: type) type {
         /// Destroys every live item through its own destructor, in forward order.
         /// Default callback over `deinitItems`: prefers `deinit(allocator)` and
         /// falls back to `destroy(allocator)`. For pointer records (e.g.
-        /// `*Texture`) the pointee type is inspected instead. The expected shape
-        /// is `pub fn deinit(self: *Self, std.mem.Allocator) void` (same for
-        /// `destroy`); a type-erased `self: *anyopaque` receiver is accepted too
-        /// (cast it back inside with `@ptrCast(@alignCast(self))`), as is an
-        /// `!void` return (propagated).
+        /// `*Texture`, `*const Texture`) the pointee type is inspected instead.
+        /// Accepted `self` shapes (for both `deinit` and `destroy`), independent
+        /// of whether the pool stores `T`, `*T` or `*const T`:
+        /// `T` (by value), `*T`, `*const T`, `*anyopaque`, `*const anyopaque`.
+        /// A `*const T` pool storing a const pointer is `@constCast`-ed back to
+        /// mutable when the destructor requires a mutable receiver
+        /// (`*T` / `*anyopaque`); a value receiver gets `ptr.*` (a copy).
+        /// The expected shape is `pub fn deinit(self, std.mem.Allocator) void`
+        /// (same for `destroy`); a type-erased receiver is cast back inside with
+        /// `@ptrCast(@alignCast(self))`, as is an `!void` return (propagated).
         /// If neither declaration exists, compilation fails with a
         /// hint to use `deinitItems` with an explicit callback instead.
         /// Pool bookkeeping is left intact: call `deinit` afterwards to free it.
@@ -236,24 +241,63 @@ pub fn SlotPool(comptime T: type) type {
             // function, so `recv.deinit(a)` would not resolve, while the
             // qualified form accepts both `*Self` and `*anyopaque` receivers.
             const Auto = struct {
+                /// Forwards a `*Host` / `*const Host` pointer to whatever `self`
+                /// shape the destructor declares: by value (`ptr.*`), mutable or
+                /// const concrete pointer (direct, `@constCast` when a mutable
+                /// receiver meets a const pointer, e.g. from a `*const T` pool),
+                /// or type-erased (`*anyopaque` / `*const anyopaque`, same const
+                /// rule, implicit coercion handles the type erasure).
+                inline fn invoke(comptime dtor: anytype, host_ptr: anytype, a: std.mem.Allocator) anyerror!void {
+                    const SelfParam = @typeInfo(@TypeOf(dtor)).@"fn".params[0].type orelse
+                        @compileError("destructor first param must have an explicit type");
+                    if (SelfParam == Host) {
+                        const r = dtor(host_ptr.*, a);
+                        if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                    } else {
+                        const sp_info = @typeInfo(SelfParam);
+                        if (sp_info != .pointer) {
+                            @compileError("destructor self must be T, *T, *const T, *anyopaque or *const anyopaque, got " ++ @typeName(SelfParam));
+                        }
+                        const sp = sp_info.pointer;
+                        const is_host = (sp.child == Host);
+                        const is_erased = (sp.child == anyopaque);
+                        if (!is_host and !is_erased) {
+                            @compileError("destructor self must be T, *T, *const T, *anyopaque or *const anyopaque, got " ++ @typeName(SelfParam));
+                        }
+                        if (sp.is_const) {
+                            // `*const T` / `*const anyopaque`: mutable and const
+                            // sources both coerce (incl. concrete -> opaque).
+                            const r = dtor(host_ptr, a);
+                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                        } else {
+                            // Mutable receiver: drop const from a `*const T`
+                            // pool pointer when required.
+                            if (comptime @typeInfo(@TypeOf(host_ptr)).pointer.is_const) {
+                                const mut = @constCast(host_ptr);
+                                const r = dtor(mut, a);
+                                if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                            } else {
+                                const r = dtor(host_ptr, a);
+                                if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                            }
+                        }
+                    }
+                }
+
                 inline fn run(a: std.mem.Allocator, ref: Resource) anyerror!void {
                     if (comptime @typeInfo(T) == .pointer) {
                         const stored: T = get(ref).?.*;
                         if (comptime has_deinit) {
-                            const r = Host.deinit(stored, a);
-                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                            try invoke(Host.deinit, stored, a);
                         } else {
-                            const r = Host.destroy(stored, a);
-                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                            try invoke(Host.destroy, stored, a);
                         }
                     } else {
                         const item = get(ref).?;
                         if (comptime has_deinit) {
-                            const r = Host.deinit(item, a);
-                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                            try invoke(Host.deinit, item, a);
                         } else {
-                            const r = Host.destroy(item, a);
-                            if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
+                            try invoke(Host.destroy, item, a);
                         }
                     }
                 }
@@ -751,4 +795,471 @@ test "pool deinitItemsAuto works for pointer records via pointee" {
     try std.testing.expectEqual(@as(usize, 2), Tex.calls);
     try std.testing.expectEqual(@as(usize, 0), t1.owned.len);
     try std.testing.expectEqual(@as(usize, 0), t2.owned.len);
+}
+
+test "pool deinitItemsAuto all self x pool x method combos" {
+    const alloc = std.testing.allocator;
+
+    // ---- deinit, self by value (T) ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn deinit(self: @This(), a: std.mem.Allocator) void {
+                a.free(self.owned);
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+    }
+
+    // ---- deinit, self *T ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+                a.free(self.owned);
+                self.owned = &.{};
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            const r2 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r1).?.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            // const pool is constCast-ed to mutable inside: mutation visible
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+    }
+
+    // ---- deinit, self *const T ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn deinit(self: *const @This(), a: std.mem.Allocator) void {
+                a.free(self.owned);
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+    }
+
+    // ---- deinit, self *anyopaque ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn deinit(self: *anyopaque, a: std.mem.Allocator) void {
+                const this: *@This() = @ptrCast(@alignCast(self));
+                a.free(this.owned);
+                this.owned = &.{};
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            const r2 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r1).?.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+    }
+
+    // ---- deinit, self *const anyopaque ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn deinit(self: *const anyopaque, a: std.mem.Allocator) void {
+                const this: *const @This() = @ptrCast(@alignCast(self));
+                a.free(this.owned);
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+    }
+
+    // ---- destroy, self by value (T) ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn destroy(self: @This(), a: std.mem.Allocator) void {
+                a.free(self.owned);
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+    }
+
+    // ---- destroy, self *T ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn destroy(self: *@This(), a: std.mem.Allocator) void {
+                a.free(self.owned);
+                self.owned = &.{};
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            const r2 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r1).?.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+    }
+
+    // ---- destroy, self *const T ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn destroy(self: *const @This(), a: std.mem.Allocator) void {
+                a.free(self.owned);
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+    }
+
+    // ---- destroy, self *anyopaque ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn destroy(self: *anyopaque, a: std.mem.Allocator) void {
+                const this: *@This() = @ptrCast(@alignCast(self));
+                a.free(this.owned);
+                this.owned = &.{};
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            const r2 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r1).?.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+            try std.testing.expectEqual(@as(usize, 0), h1.owned.len);
+            try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
+        }
+    }
+
+    // ---- destroy, self *const anyopaque ----
+    {
+        const H = struct {
+            owned: []u8,
+            var calls: usize = 0;
+            pub fn destroy(self: *const anyopaque, a: std.mem.Allocator) void {
+                const this: *const @This() = @ptrCast(@alignCast(self));
+                a.free(this.owned);
+                calls += 1;
+            }
+        };
+        {
+            const P = SlotPool(H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
+            _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{2}) });
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+        {
+            const P = SlotPool(*const H);
+            defer P.deinit(alloc);
+            H.calls = 0;
+            var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
+            var h2 = H{ .owned = try alloc.dupe(u8, &[_]u8{2}) };
+            _ = try P.add(alloc, &h1);
+            _ = try P.add(alloc, &h2);
+            try P.deinitItemsAuto(alloc);
+            try std.testing.expectEqual(@as(usize, 2), H.calls);
+        }
+    }
 }
