@@ -21,12 +21,7 @@ const std = @import("std");
 /// - `tag`: enum literal isolating store instances (`@EnumLiteral` style, e.g.
 ///   `.default`). Must match the `ResourceStore(resource_type, tag)` instance.
 /// Returns: reference struct type with resolving accessors.
-pub fn Resource(comptime resource_type: type, comptime tag: anytype) type {
-    comptime {
-        if (@typeInfo(@TypeOf(tag)) != .enum_literal) {
-            @compileError("Resource tag must be an enum literal, e.g. .default");
-        }
-    }
+pub fn Resource(comptime resource_type: type, comptime tag: @EnumLiteral()) type {
     return packed struct {
         /// Store tag this reference resolves through.
         pub const tag_value = tag;

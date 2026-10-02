@@ -28,12 +28,7 @@ const Occupancy = bit_tree.Bitset(.u64);
 /// - `tag`: enum literal isolating instances (`@EnumLiteral` style, e.g.
 ///   `.default`, `.main`). Must be an enum literal.
 /// Returns: store namespace with static storage and operations.
-pub fn ResourceStore(comptime T: type, comptime tag: anytype) type {
-    comptime {
-        if (@typeInfo(@TypeOf(tag)) != .enum_literal) {
-            @compileError("ResourceStore tag must be an enum literal, e.g. .default");
-        }
-    }
+pub fn ResourceStore(comptime T: type, comptime tag: @EnumLiteral()) type {
     return struct {
         /// Store tag isolating instances for the same `T`.
         pub const tag_value = tag;
