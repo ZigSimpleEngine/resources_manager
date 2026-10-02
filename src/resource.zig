@@ -1,13 +1,13 @@
 /// Standard library import.
 const std = @import("std");
 
-/// Creates an ECS-compatible resource reference to a value stored in a `SlotPool`.
+/// Creates an ECS-compatible resource reference to a value stored in a `ResourceStore`.
 ///
 /// The reference stores only `id` + `gen` (4 bytes, plain copyable data), so it
 /// fits the ECS rule "components are copyable value structs" used across every
 /// component in this architecture: resource -> abstraction -> component holding
 /// the pooled abstraction. Resolution goes through the global
-/// `SlotPool(resource_type)`, therefore `get` needs no pool parameter.
+/// `ResourceStore(resource_type, tag)`, therefore `get` needs no store parameter.
 ///
 /// The `id` is the stable slot index: it never changes while the slot is
 /// occupied and is recycled through the free list after removal. The `gen`
@@ -18,16 +18,27 @@ const std = @import("std");
 /// Parameters:
 /// - `resource_type`: pooled record type, e.g. an abstraction struct or a
 ///   direct pointer such as `*Texture` for non-generic types.
+/// - `tag`: enum literal isolating store instances (`@EnumLiteral` style, e.g.
+///   `.default`). Must match the `ResourceStore(resource_type, tag)` instance.
 /// Returns: reference struct type with resolving accessors.
-pub fn Resource(comptime resource_type: type) type {
+pub fn Resource(comptime resource_type: type, comptime tag: anytype) type {
+    comptime {
+        if (@typeInfo(@TypeOf(tag)) != .enum_literal) {
+            @compileError("Resource tag must be an enum literal, e.g. .default");
+        }
+    }
     return packed struct {
-        /// Stable slot index inside the pool. Defaults to the null sentinel.
+        /// Store tag this reference resolves through.
+        pub const tag_value = tag;
+        /// Pooled record type.
+        pub const resource_type_value = resource_type;
+        /// Stable slot index inside the store. Defaults to the null sentinel.
         id: u24 = std.math.maxInt(u24),
         /// Slot generation at the time the reference was issued.
         gen: u8 = 0,
 
         /// Null (empty) reference: never matches a live slot (`get` rejects it
-        /// by bounds check). `Resource(resource_type){}` equals this value.
+        /// by bounds check). `Resource(resource_type, tag){}` equals this value.
         pub const NULL: @This() = .{ .id = std.math.maxInt(u24), .gen = 0 };
 
         /// Checks whether this is the null (empty) reference.
@@ -38,13 +49,13 @@ pub fn Resource(comptime resource_type: type) type {
             return self.id == std.math.maxInt(u24);
         }
 
-        /// Resolves the reference to the pooled resource.
+        /// Resolves the reference to the stored resource.
         /// Parameters:
         /// - self: reference to resolve.
         /// Returns: pointer to the resource, or null when removed or the
         /// generation mismatches (stale reference).
         pub fn get(self: @This()) ?*resource_type {
-            return @import("pool.zig").SlotPool(resource_type).get(self);
+            return @import("pool.zig").ResourceStore(resource_type, tag).get(self);
         }
 
         /// Checks whether the referenced slot is live with a matching generation.
@@ -52,14 +63,14 @@ pub fn Resource(comptime resource_type: type) type {
         /// - self: reference to inspect.
         /// Returns: true for a live, generation-matching slot.
         pub fn isAlive(self: @This()) bool {
-            return @import("pool.zig").SlotPool(resource_type).isAlive(self);
+            return @import("pool.zig").ResourceStore(resource_type, tag).isAlive(self);
         }
     };
 }
 
 test "resource null sentinel" {
     const R = struct { v: i32 };
-    const Res = Resource(R);
+    const Res = Resource(R, .default);
     try std.testing.expect(Res.NULL.isNull());
     try std.testing.expect((Res{}).isNull());
     try std.testing.expect(!(Res{ .id = 0, .gen = 0 }).isNull());
@@ -68,7 +79,7 @@ test "resource null sentinel" {
 
 test "resource resolves and goes stale" {
     const R = struct { v: i32 };
-    const P = @import("pool.zig").SlotPool(R);
+    const P = @import("pool.zig").ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 

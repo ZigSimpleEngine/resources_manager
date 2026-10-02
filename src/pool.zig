@@ -8,28 +8,41 @@ const bit_tree = @import("bit_tree");
 /// Flat occupancy bitset, one bit per slot.
 const Occupancy = bit_tree.Bitset(.u64);
 
-/// Creates a global per-type resource pool with stable ids.
+/// Creates a global per-type resource store with stable ids.
 ///
-/// Each instantiation `SlotPool(T)` owns its own static storage, so repeating
-/// the same instantiation from any point of the program yields the same pool.
-/// The pool only tracks resources: it never destroys the stored values.
+/// Each instantiation `ResourceStore(T, tag)` owns its own static storage, so
+/// repeating the same `(T, tag)` from any point of the program yields the same
+/// store, while different `tag`s give fully isolated instances for the same `T`
+/// (e.g. `ResourceStore(Mesh, .main)` vs `ResourceStore(Mesh, .ui)`).
+/// The store only tracks resources: it never destroys the stored values.
 ///
-/// Storage per pool:
+/// Storage per store:
 /// - `slots` — resources, index == stable id;
 /// - `free_ids` — ids of empty slots reused by the next `add`;
 /// - `occupied` — occupancy bitmap (`bit_tree.Bitset`), one bit per slot;
 /// - `generations` — one byte per slot, bumped (`+%= 1`) on every `remove`.
 ///
 /// Parameters:
-/// - `T`: resource record type stored in the pool (e.g. an abstraction struct
+/// - `T`: resource record type stored in the store (e.g. an abstraction struct
 ///   or a direct pointer such as `*Texture` for non-generic types).
-/// Returns: pool namespace with static storage and operations.
-pub fn SlotPool(comptime T: type) type {
+/// - `tag`: enum literal isolating instances (`@EnumLiteral` style, e.g.
+///   `.default`, `.main`). Must be an enum literal.
+/// Returns: store namespace with static storage and operations.
+pub fn ResourceStore(comptime T: type, comptime tag: anytype) type {
+    comptime {
+        if (@typeInfo(@TypeOf(tag)) != .enum_literal) {
+            @compileError("ResourceStore tag must be an enum literal, e.g. .default");
+        }
+    }
     return struct {
+        /// Store tag isolating instances for the same `T`.
+        pub const tag_value = tag;
+        /// Stored record type.
+        pub const resource_type = T;
         /// ECS-compatible reference to a pooled resource.
-        /// Re-exported here so users take it from the pool
-        /// (`const res: MeshPool.Resource = ...`) instead of importing it directly.
-        pub const Resource = resource_mod.Resource(T);
+        /// Re-exported here so users take it from the store
+        /// (`const res: MeshStore.Resource = ...`) instead of importing it directly.
+        pub const Resource = resource_mod.Resource(T, tag);
 
         /// Slot storage, index == stable id. `null` means the slot is free.
         var slots: std.ArrayListUnmanaged(?T) = .empty;
@@ -232,7 +245,7 @@ pub fn SlotPool(comptime T: type) type {
                 else => false,
             };
             if (!has_deinit and !has_destroy) {
-                @compileError("SlotPool(" ++ @typeName(T) ++ "): deinitItemsAuto requires `pub fn deinit(allocator)` or `pub fn destroy(allocator)` on the pooled type (or its pointee for pointer types); use deinitItems(alloc, customCallback) instead.");
+                @compileError("ResourceStore(" ++ @typeName(T) ++ "): deinitItemsAuto requires `pub fn deinit(allocator)` or `pub fn destroy(allocator)` on the pooled type (or its pointee for pointer types); use deinitItems(alloc, customCallback) instead.");
             }
             // Tolerates both `void` and `!void` destructors: the result is only
             // `try`-ed when it actually is an error union.
@@ -309,7 +322,7 @@ pub fn SlotPool(comptime T: type) type {
 
 test "pool add/get/remove with id reuse and generation bump" {
     const R = struct { v: i32 };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -335,7 +348,7 @@ test "pool add/get/remove with id reuse and generation bump" {
 
 test "pool double remove and unknown refs" {
     const R = struct { v: u8 };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -348,7 +361,7 @@ test "pool double remove and unknown refs" {
 
 test "pool iterator visits live refs in order" {
     const R = struct { v: u32 };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -378,7 +391,7 @@ test "pool iterator visits live refs in order" {
 
 test "pool iterator corner cases" {
     const R = struct { v: usize };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -487,7 +500,7 @@ test "pool iterator corner cases" {
 
 test "pool iterator multi-word bitmap" {
     const R = struct { v: usize };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -555,7 +568,7 @@ test "pool iterator multi-word bitmap" {
 }
 
 test "pool stores pointer resources directly" {
-    const P = SlotPool(*u32);
+    const P = ResourceStore(*u32, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -566,7 +579,7 @@ test "pool stores pointer resources directly" {
 
 test "pool deinitItems visits every live ref with allocator context" {
     const R = struct { v: u32, owned: []u8 };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -624,7 +637,7 @@ test "pool deinitItems visits every live ref with allocator context" {
 
 test "pool deinitItems propagates callback errors" {
     const R = struct { v: u32 };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -656,7 +669,7 @@ test "pool deinitItemsAuto prefers deinit over destroy" {
             calls_destroy += 1;
         }
     };
-    const P = SlotPool(R);
+    const P = ResourceStore(R, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -689,7 +702,7 @@ test "pool deinitItemsAuto falls back to destroy" {
             calls += 1;
         }
     };
-    const P = SlotPool(D);
+    const P = ResourceStore(D, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -712,7 +725,7 @@ test "pool deinitItemsAuto propagates destructor errors" {
             return error.Boom;
         }
     };
-    const P = SlotPool(F);
+    const P = ResourceStore(F, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -732,7 +745,7 @@ test "pool deinitItemsAuto supports anyopaque self destructor" {
             calls += 1;
         }
     };
-    const P = SlotPool(G);
+    const P = ResourceStore(G, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -757,7 +770,7 @@ test "pool deinitItemsAuto supports anyopaque self destroy on pointee" {
             calls += 1;
         }
     };
-    const P = SlotPool(*H);
+    const P = ResourceStore(*H, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -782,7 +795,7 @@ test "pool deinitItemsAuto works for pointer records via pointee" {
             calls += 1;
         }
     };
-    const P = SlotPool(*Tex);
+    const P = ResourceStore(*Tex, .default);
     const alloc = std.testing.allocator;
     defer P.deinit(alloc);
 
@@ -811,7 +824,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -820,7 +833,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -831,7 +844,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -855,7 +868,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -866,7 +879,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -879,7 +892,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -905,7 +918,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -914,7 +927,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -925,7 +938,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -950,7 +963,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -961,7 +974,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -974,7 +987,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1000,7 +1013,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -1009,7 +1022,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1020,7 +1033,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1043,7 +1056,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -1052,7 +1065,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1063,7 +1076,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1087,7 +1100,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -1098,7 +1111,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1111,7 +1124,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1136,7 +1149,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -1145,7 +1158,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1156,7 +1169,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1181,7 +1194,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             const r1 = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -1192,7 +1205,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), P.get(r2).?.owned.len);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1205,7 +1218,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 0), h2.owned.len);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1231,7 +1244,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             }
         };
         {
-            const P = SlotPool(H);
+            const P = ResourceStore(H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             _ = try P.add(alloc, .{ .owned = try alloc.dupe(u8, &[_]u8{1}) });
@@ -1240,7 +1253,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*H);
+            const P = ResourceStore(*H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1251,7 +1264,7 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
         {
-            const P = SlotPool(*const H);
+            const P = ResourceStore(*const H, .default);
             defer P.deinit(alloc);
             H.calls = 0;
             var h1 = H{ .owned = try alloc.dupe(u8, &[_]u8{1}) };
@@ -1262,4 +1275,50 @@ test "pool deinitItemsAuto all self x pool x method combos" {
             try std.testing.expectEqual(@as(usize, 2), H.calls);
         }
     }
+}
+
+test "ResourceStore isolates instances by tag" {
+    const alloc = std.testing.allocator;
+    const R = struct { v: i32 };
+
+    const A = ResourceStore(R, .a);
+    const B = ResourceStore(R, .b);
+    const A2 = ResourceStore(R, .a);
+    defer A.deinit(alloc);
+    defer B.deinit(alloc);
+    // A and A2 share storage; B is fully isolated.
+
+    try std.testing.expect(A.tag_value == .a);
+    try std.testing.expect(B.tag_value == .b);
+    try std.testing.expect(A.Resource == A2.Resource);
+    try std.testing.expect(A.Resource != B.Resource);
+
+    const ra: A.Resource = try A.add(alloc, .{ .v = 7 });
+    try std.testing.expectEqual(@as(usize, 1), A.liveCount());
+    try std.testing.expectEqual(@as(usize, 0), B.liveCount());
+    try std.testing.expectEqual(@as(usize, 1), A2.liveCount());
+
+    // Same (T, tag) sees the same slot…
+    try std.testing.expect(A2.isAlive(ra));
+    try std.testing.expectEqual(@as(i32, 7), A2.get(ra).?.v);
+    // …while a different tag does not (same id, foreign generation space).
+    const foreign: B.Resource = .{ .id = ra.id, .gen = ra.gen };
+    try std.testing.expect(!B.isAlive(foreign));
+    try std.testing.expect(B.get(foreign) == null);
+
+    // Refs resolve through their own tagged store.
+    try std.testing.expect(ra.isAlive());
+    try std.testing.expectEqual(@as(i32, 7), ra.get().?.v);
+
+    const rb: B.Resource = try B.add(alloc, .{ .v = 42 });
+    try std.testing.expectEqual(@as(usize, 1), A.liveCount());
+    try std.testing.expectEqual(@as(usize, 1), B.liveCount());
+    try std.testing.expectEqual(@as(i32, 7), ra.get().?.v);
+    try std.testing.expectEqual(@as(i32, 42), rb.get().?.v);
+
+    // Removing from one instance does not affect the other.
+    _ = try A.remove(alloc, ra);
+    try std.testing.expectEqual(@as(usize, 0), A.liveCount());
+    try std.testing.expectEqual(@as(usize, 1), B.liveCount());
+    try std.testing.expect(rb.isAlive());
 }

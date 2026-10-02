@@ -1,12 +1,14 @@
-/// Global per-type resource pool with stable ids, free list, occupancy bitmap and generations.
-pub const SlotPool = @import("pool.zig").SlotPool;
+/// Global per-type resource store with stable ids, free list, occupancy bitmap and generations.
+pub const ResourceStore = @import("pool.zig").ResourceStore;
+pub const Resource = @import("resource.zig").Resource;
 
 // Intended downstream wiring (occupancy lives in `bit_tree.Bitset`):
-//   const MeshPool = SlotPool(MyMeshRecord);      // one global pool per record type
-//   const res: MeshPool.Resource = try MeshPool.add(alloc, record); // 4-byte ECS-ready ref
+//   const MeshStore = ResourceStore(MyMeshRecord, .default); // one global store per (record, tag)
+//   const MeshStoreUI = ResourceStore(MyMeshRecord, .ui);     // isolated instance, same record type
+//   const res: MeshStore.Resource = try MeshStore.add(alloc, record); // 4-byte ECS-ready ref
 //   if (res.get()) |rec| { ... }                 // null when removed or stale
-//   if (try MeshPool.remove(alloc, res)) |rec| { /* destroy separately */ }
-//   const It = MeshPool.Iterator(*Ctx, Ctx.onItem, .forward);
+//   if (try MeshStore.remove(alloc, res)) |rec| { /* destroy separately */ }
+//   const It = MeshStore.Iterator(*Ctx, Ctx.onItem, .forward);
 //   _ = try It.iterateAll(&ctx, null, null);     // onItem(ctx, ref: Resource)
 
 test {
