@@ -256,7 +256,7 @@ pub fn ResourceStore(comptime T: type, comptime tag: @EnumLiteral()) type {
                 /// or type-erased (`*anyopaque` / `*const anyopaque`, same const
                 /// rule, implicit coercion handles the type erasure).
                 inline fn invoke(comptime dtor: anytype, host_ptr: anytype, a: std.mem.Allocator) anyerror!void {
-                    const SelfParam = @typeInfo(@TypeOf(dtor)).@"fn".params[0].type orelse
+                    const SelfParam = @typeInfo(@TypeOf(dtor)).@"fn".param_types[0] orelse
                         @compileError("destructor first param must have an explicit type");
                     if (SelfParam == Host) {
                         const r = dtor(host_ptr.*, a);
@@ -272,7 +272,7 @@ pub fn ResourceStore(comptime T: type, comptime tag: @EnumLiteral()) type {
                         if (!is_host and !is_erased) {
                             @compileError("destructor self must be T, *T, *const T, *anyopaque or *const anyopaque, got " ++ @typeName(SelfParam));
                         }
-                        if (sp.is_const) {
+                        if (sp.attrs.@"const") {
                             // `*const T` / `*const anyopaque`: mutable and const
                             // sources both coerce (incl. concrete -> opaque).
                             const r = dtor(host_ptr, a);
@@ -280,7 +280,7 @@ pub fn ResourceStore(comptime T: type, comptime tag: @EnumLiteral()) type {
                         } else {
                             // Mutable receiver: drop const from a `*const T`
                             // pool pointer when required.
-                            if (comptime @typeInfo(@TypeOf(host_ptr)).pointer.is_const) {
+                            if (comptime @typeInfo(@TypeOf(host_ptr)).pointer.attrs.@"const") {
                                 const mut = @constCast(host_ptr);
                                 const r = dtor(mut, a);
                                 if (comptime @typeInfo(@TypeOf(r)) == .error_union) try r;
