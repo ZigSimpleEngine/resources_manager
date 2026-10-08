@@ -6,7 +6,7 @@ pub const Options = struct {
     /// The target architecture for which the module will be built.
     target: ?std.Build.ResolvedTarget = null,
     /// The optimization mode used to compile the module.
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
     /// Explicit `bit_tree` module. When null, resolved via local `build.zig.zon` dependency.
     dependency_bit_tree: ?*std.Build.Module = null,
 
