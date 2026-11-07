@@ -2,7 +2,7 @@
 pub const ResourceStore = @import("pool.zig").ResourceStore;
 pub const Resource = @import("resource.zig").Resource;
 
-// Intended downstream wiring (occupancy lives in `bit_tree.Bitset`):
+// Intended downstream wiring (occupancy lives in `bit_structs.Bitset`):
 //   const MeshStore = ResourceStore(MyMeshRecord, .default); // one global store per (record, tag)
 //   const MeshStoreUI = ResourceStore(MyMeshRecord, .ui);     // isolated instance, same record type
 //   const res: MeshStore.Resource = try MeshStore.add(alloc, record); // 4-byte ECS-ready ref

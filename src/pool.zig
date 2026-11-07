@@ -3,10 +3,10 @@ const std = @import("std");
 /// Resource reference type import.
 const resource_mod = @import("resource.zig");
 /// Hierarchical bit utilities, occupancy backend.
-const bit_tree = @import("bit_tree");
+const bit_structs = @import("bit_structs");
 
 /// Flat occupancy bitset, one bit per slot.
-const Occupancy = bit_tree.Bitset(.u64);
+const Occupancy = bit_structs.Bitset(.u64);
 
 /// Creates a global per-type resource store with stable ids.
 ///
@@ -19,7 +19,7 @@ const Occupancy = bit_tree.Bitset(.u64);
 /// Storage per store:
 /// - `slots` — resources, index == stable id;
 /// - `free_ids` — ids of empty slots reused by the next `add`;
-/// - `occupied` — occupancy bitmap (`bit_tree.Bitset`), one bit per slot;
+/// - `occupied` — occupancy bitmap (`bit_structs.Bitset`), one bit per slot;
 /// - `generations` — one byte per slot, bumped (`+%= 1`) on every `remove`.
 ///
 /// Parameters:
@@ -117,7 +117,7 @@ pub fn ResourceStore(comptime T: type, comptime tag: @EnumLiteral()) type {
         }
 
         /// Active-only iterator over live slots, thin wrapper over the
-        /// `bit_tree` bitset iterator with the inactive callback removed.
+        /// `bit_structs` bitset iterator with the inactive callback removed.
         /// The single callback fires per occupied bit with a ready `Resource`
         /// (`get()` resolves the value); iterating inactive bits makes no
         /// sense here and would break pool invariants, so it is not exposed.
@@ -128,7 +128,7 @@ pub fn ResourceStore(comptime T: type, comptime tag: @EnumLiteral()) type {
         pub fn Iterator(
             comptime Context: type,
             comptime on_item: fn (context: Context, ref: Resource) callconv(.@"inline") anyerror!bool,
-            comptime direction: bit_tree.Direction,
+            comptime direction: bit_structs.Direction,
         ) type {
             return struct {
                 /// Carrier for the outer caller context through the bitset walk.

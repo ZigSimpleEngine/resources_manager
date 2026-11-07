@@ -7,8 +7,8 @@ pub const Options = struct {
     target: ?std.Build.ResolvedTarget = null,
     /// The optimization mode used to compile the module.
     optimize: ?std.lang.Optimize = null,
-    /// Explicit `bit_tree` module. When null, resolved via local `build.zig.zon` dependency.
-    dependency_bit_tree: ?*std.Build.Module = null,
+    /// Explicit `bit_structs` module. When null, resolved via local `build.zig.zon` dependency.
+    dependency_bit_structs: ?*std.Build.Module = null,
 
     pub fn initFromOptions(b: *std.Build) Options {
         return .{
@@ -35,16 +35,16 @@ pub const Options = struct {
             .target = target,
             .optimize = optimize,
         });
-        const bit_tree_mod = self.dependency_bit_tree orelse self_dep.builder.dependency("bit_tree", .{
+        const bit_structs_mod = self.dependency_bit_structs orelse self_dep.builder.dependency("bit_structs", .{
             .target = target,
             .optimize = optimize,
-        }).module("bit_tree");
+        }).module("bit_structs");
         const mod = b.createModule(.{
             .root_source_file = self_dep.path("src/root.zig"),
             .target = target,
             .optimize = optimize,
         });
-        mod.addImport("bit_tree", bit_tree_mod);
+        mod.addImport("bit_structs", bit_structs_mod);
         return mod;
     }
 };
@@ -54,16 +54,16 @@ pub const Options = struct {
 fn createModuleOwn(b: *std.Build, options: Options) *std.Build.Module {
     const target = options.target orelse b.standardTargetOptions(.{});
     const optimize = options.optimize orelse b.standardOptimizeOption(.{});
-    const bit_tree_mod = options.dependency_bit_tree orelse b.dependency("bit_tree", .{
+    const bit_structs_mod = options.dependency_bit_structs orelse b.dependency("bit_structs", .{
         .target = target,
         .optimize = optimize,
-    }).module("bit_tree");
+    }).module("bit_structs");
     const mod = b.addModule("resources_manager", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    mod.addImport("bit_tree", bit_tree_mod);
+    mod.addImport("bit_structs", bit_structs_mod);
     return mod;
 }
 
